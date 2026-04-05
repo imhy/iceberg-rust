@@ -60,6 +60,7 @@ pub struct TableScanBuilder<'a> {
     concurrency_limit_manifest_files: usize,
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    split_size: Option<u64>,
 }
 
 impl<'a> TableScanBuilder<'a> {
@@ -78,6 +79,7 @@ impl<'a> TableScanBuilder<'a> {
             concurrency_limit_manifest_files: num_cpus,
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
+            split_size: None,
         }
     }
 
@@ -184,6 +186,19 @@ impl<'a> TableScanBuilder<'a> {
         self
     }
 
+    /// Sets the target split size in bytes for file split planning.
+    ///
+    /// When set, large files will be split into multiple [`FileScanTask`]s, each
+    /// covering a byte range. If the file has `split_offsets` (e.g., Parquet row group
+    /// boundaries), splits are created at those boundaries. Otherwise, the file is
+    /// divided into fixed-size chunks of `split_size` bytes.
+    ///
+    /// Defaults to `None` (no splitting — one task per file).
+    pub fn with_split_size(mut self, split_size: u64) -> Self {
+        self.split_size = Some(split_size);
+        self
+    }
+
     /// Build the table scan.
     pub fn build(self) -> Result<TableScan> {
         let snapshot = match self.snapshot_id {
@@ -210,6 +225,7 @@ impl<'a> TableScanBuilder<'a> {
                         concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
                         row_group_filtering_enabled: self.row_group_filtering_enabled,
                         row_selection_enabled: self.row_selection_enabled,
+                        split_size: self.split_size,
                     });
                 };
                 current_snapshot_id.clone()
@@ -303,6 +319,7 @@ impl<'a> TableScanBuilder<'a> {
             concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
+            split_size: self.split_size,
         })
     }
 }
@@ -331,6 +348,7 @@ pub struct TableScan {
 
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    split_size: Option<u64>,
 }
 
 impl TableScan {
@@ -408,6 +426,7 @@ impl TableScan {
         .await;
 
         // Process the data file [`ManifestEntry`] stream in parallel
+        let split_size = self.split_size;
         spawn(async move {
             let result = manifest_entry_data_ctx_rx
                 .map(|me_ctx| Ok((me_ctx, file_scan_task_tx.clone())))
@@ -415,7 +434,12 @@ impl TableScan {
                     concurrency_limit_manifest_entries,
                     |(manifest_entry_context, tx)| async move {
                         spawn(async move {
-                            Self::process_data_manifest_entry(manifest_entry_context, tx).await
+                            Self::process_data_manifest_entry(
+                                manifest_entry_context,
+                                tx,
+                                split_size,
+                            )
+                            .await
                         })
                         .await
                     },
@@ -457,6 +481,7 @@ impl TableScan {
     async fn process_data_manifest_entry(
         manifest_entry_context: ManifestEntryContext,
         mut file_scan_task_tx: Sender<Result<FileScanTask>>,
+        split_size: Option<u64>,
     ) -> Result<()> {
         // skip processing this manifest entry if it has been marked as deleted
         if !manifest_entry_context.manifest_entry.is_alive() {
@@ -504,9 +529,27 @@ impl TableScan {
         // congratulations! the manifest entry has made its way through the
         // entire plan without getting filtered out. Create a corresponding
         // FileScanTask and push it to the result stream
-        file_scan_task_tx
-            .send(Ok(manifest_entry_context.into_file_scan_task().await?))
-            .await?;
+        let split_offsets: Option<Vec<i64>> = manifest_entry_context
+            .manifest_entry
+            .data_file()
+            .split_offsets()
+            .map(|s| s.to_vec());
+        let file_size = manifest_entry_context.manifest_entry.file_size_in_bytes();
+        let task = manifest_entry_context.into_file_scan_task().await?;
+
+        if let Some(target_split_size) = split_size {
+            let tasks = split_file_scan_task(
+                task,
+                split_offsets.as_deref(),
+                target_split_size,
+                file_size,
+            );
+            for t in tasks {
+                file_scan_task_tx.send(Ok(t)).await?;
+            }
+        } else {
+            file_scan_task_tx.send(Ok(task)).await?;
+        }
 
         Ok(())
     }

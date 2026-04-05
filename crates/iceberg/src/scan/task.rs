@@ -112,6 +112,75 @@ pub struct FileScanTask {
     pub case_sensitive: bool,
 }
 
+/// Splits a [`FileScanTask`] into multiple tasks based on split offsets (e.g., Parquet row group
+/// boundaries) or a target split size.
+///
+/// Two strategies (matching Java's `BaseContentScanTask.split()`):
+/// - **OffsetsAware**: when `split_offsets` are present and strictly ascending, creates one task
+///   per offset boundary. Each task covers `[offsets[i], offsets[i+1])`, with the last task
+///   extending to `file_size`.
+/// - **FixedSize**: when `split_offsets` are absent, divides the file into chunks of
+///   `target_split_size`.
+///
+/// Split tasks have `record_count = None` since the per-split row count is unknown without
+/// reading Parquet metadata.
+pub fn split_file_scan_task(
+    task: FileScanTask,
+    split_offsets: Option<&[i64]>,
+    target_split_size: u64,
+    file_size: u64,
+) -> Vec<FileScanTask> {
+
+    // Try OffsetsAware strategy: use split_offsets if present and valid
+    if let Some(offsets) = split_offsets
+        && !offsets.is_empty()
+        && is_strictly_ascending(offsets)
+    {
+        let mut tasks = Vec::with_capacity(offsets.len());
+        for i in 0..offsets.len() {
+            let start = offsets[i] as u64;
+            let length = if i + 1 < offsets.len() {
+                offsets[i + 1] as u64 - start
+            } else {
+                file_size - start
+            };
+
+            tasks.push(FileScanTask {
+                start,
+                length,
+                record_count: None,
+                ..task.clone()
+            });
+        }
+        return tasks;
+    }
+
+    // FixedSize strategy: divide file into chunks of target_split_size
+    if target_split_size > 0 && file_size > target_split_size {
+        let mut tasks = Vec::new();
+        let mut offset = 0u64;
+        while offset < file_size {
+            let length = std::cmp::min(target_split_size, file_size - offset);
+            tasks.push(FileScanTask {
+                start: offset,
+                length,
+                record_count: None,
+                ..task.clone()
+            });
+            offset += length;
+        }
+        return tasks;
+    }
+
+    // No splitting: return original task as-is
+    vec![task]
+}
+
+/// Returns true if the slice is strictly ascending (each element > previous).
+fn is_strictly_ascending(offsets: &[i64]) -> bool {
+    offsets.windows(2).all(|w| w[0] < w[1])
+}
+
 impl FileScanTask {
     /// Returns the data file path of this file scan task.
     pub fn data_file_path(&self) -> &str {
@@ -174,4 +243,122 @@ pub struct FileScanTaskDeleteFile {
 
     /// equality ids for equality deletes (null for anything other than equality-deletes)
     pub equality_ids: Option<Vec<i32>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::spec::{DataFileFormat, Schema, SchemaRef};
+
+    fn test_schema() -> SchemaRef {
+        Arc::new(Schema::builder().build().unwrap())
+    }
+
+    fn make_task(file_size: u64) -> FileScanTask {
+        FileScanTask {
+            file_size_in_bytes: file_size,
+            start: 0,
+            length: file_size,
+            record_count: Some(1000),
+            data_file_path: "s3://bucket/data/file.parquet".to_string(),
+            data_file_format: DataFileFormat::Parquet,
+            schema: test_schema(),
+            project_field_ids: vec![1, 2, 3],
+            predicate: None,
+            deletes: vec![],
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: true,
+        }
+    }
+
+    #[test]
+    fn test_offsets_aware_basic() {
+        let task = make_task(1200);
+        let offsets = vec![100i64, 500, 900];
+        let tasks = split_file_scan_task(task, Some(&offsets), 128 * 1024 * 1024, 1200);
+
+        assert_eq!(tasks.len(), 3);
+        assert_eq!((tasks[0].start, tasks[0].length), (100, 400));
+        assert_eq!((tasks[1].start, tasks[1].length), (500, 400));
+        assert_eq!((tasks[2].start, tasks[2].length), (900, 300));
+    }
+
+    #[test]
+    fn test_fixed_size_basic() {
+        let task = make_task(1000);
+        let tasks = split_file_scan_task(task, None, 300, 1000);
+
+        assert_eq!(tasks.len(), 4);
+        assert_eq!((tasks[0].start, tasks[0].length), (0, 300));
+        assert_eq!((tasks[1].start, tasks[1].length), (300, 300));
+        assert_eq!((tasks[2].start, tasks[2].length), (600, 300));
+        assert_eq!((tasks[3].start, tasks[3].length), (900, 100));
+    }
+
+    #[test]
+    fn test_single_offset() {
+        let task = make_task(500);
+        let offsets = vec![100i64];
+        let tasks = split_file_scan_task(task, Some(&offsets), 128 * 1024 * 1024, 500);
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!((tasks[0].start, tasks[0].length), (100, 400));
+    }
+
+    #[test]
+    fn test_no_splitting_disabled() {
+        let task = make_task(500);
+        // No split_offsets and target larger than file → no splitting
+        let tasks = split_file_scan_task(task.clone(), None, 128 * 1024 * 1024, 500);
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].start, 0);
+        assert_eq!(tasks[0].length, 500);
+        assert_eq!(tasks[0].record_count, Some(1000)); // preserved
+    }
+
+    #[test]
+    fn test_empty_offsets_vec() {
+        let task = make_task(500);
+        let offsets: Vec<i64> = vec![];
+        // Empty offsets, target larger than file → no splitting
+        let tasks = split_file_scan_task(task, Some(&offsets), 128 * 1024 * 1024, 500);
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].start, 0);
+        assert_eq!(tasks[0].length, 500);
+    }
+
+    #[test]
+    fn test_record_count_cleared() {
+        let task = make_task(1200);
+        assert_eq!(task.record_count, Some(1000));
+
+        let offsets = vec![100i64, 500, 900];
+        let tasks = split_file_scan_task(task, Some(&offsets), 128 * 1024 * 1024, 1200);
+
+        for t in &tasks {
+            assert_eq!(t.record_count, None, "split tasks should have record_count = None");
+        }
+    }
+
+    #[test]
+    fn test_fields_preserved() {
+        let task = make_task(1200);
+        let offsets = vec![100i64, 500];
+        let tasks = split_file_scan_task(task, Some(&offsets), 128 * 1024 * 1024, 1200);
+
+        assert_eq!(tasks.len(), 2);
+        for t in &tasks {
+            assert_eq!(t.data_file_path, "s3://bucket/data/file.parquet");
+            assert_eq!(t.data_file_format, DataFileFormat::Parquet);
+            assert_eq!(t.project_field_ids, vec![1, 2, 3]);
+            assert_eq!(t.file_size_in_bytes, 1200);
+            assert!(t.case_sensitive);
+        }
+    }
 }
